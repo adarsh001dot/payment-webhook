@@ -3,8 +3,7 @@
 🌐 PAYMENT WEBHOOK SERVER - DARKXALPHA.IN (FIXED - NO DOUBLE POINTS)
 ===========================================
 Developer: @VIP_X_OFFICIAL
-Version: 3.0 (FIXED - Idempotency Check Added)
-Purpose: Handle payment callbacks and auto-add points (Single time only)
+Version: 3.0 (FIXED - Idempotency Check + Auto Delete Trigger)
 ===========================================
 """
 
@@ -15,6 +14,7 @@ from pytz import timezone
 import requests
 import logging
 import hashlib
+import threading
 
 # ==================== CONFIGURATION ====================
 MONGODB_URI = "mongodb+srv://nikilsaxena843_db_user:3gF2wyT4IjsFt0cY@vipbot.puv6gfk.mongodb.net/?appName=vipbot"
@@ -37,10 +37,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Store processed webhook IDs to prevent duplicates (in-memory cache)
-# For production, use Redis or database
+# Store processed webhook IDs to prevent duplicates
 processed_webhooks = {}
-PROCESSED_EXPIRY = 3600  # 1 hour
 
 # ==================== DATABASE CONNECTION ====================
 try:
@@ -51,8 +49,10 @@ try:
     orders_col = db['orders']
     
     # Create index for webhook_id to prevent duplicates
-    if 'webhook_id' not in orders_col.index_information():
+    try:
         orders_col.create_index('webhook_id', unique=True, sparse=True)
+    except:
+        pass
     
     logger.info("✅ Database Connected Successfully!")
 except Exception as e:
@@ -62,30 +62,25 @@ except Exception as e:
 
 # ==================== HELPER FUNCTIONS ====================
 def get_ist():
-    """Get current IST time"""
     return datetime.now(IST)
 
 
 def format_ist(dt):
-    """Format IST datetime"""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone('UTC')).astimezone(IST)
     return dt.strftime("%d-%m-%Y %I:%M:%S %p")
 
 
 def format_number(num):
-    """Format number with commas"""
     return f"{num:,}"
 
 
 def generate_webhook_id(order_id, timestamp, amount):
-    """Generate unique ID for webhook to prevent duplicates"""
     unique_string = f"{order_id}_{timestamp}_{amount}"
     return hashlib.md5(unique_string.encode()).hexdigest()
 
 
 def add_points(user_id, points, reason, admin_id=None):
-    """Add points to user"""
     try:
         user = users_col.find_one({'user_id': user_id})
         if not user:
@@ -98,7 +93,6 @@ def add_points(user_id, points, reason, admin_id=None):
             {'$set': {'points': new_balance}}
         )
 
-        # Log transaction
         transactions_col.insert_one({
             'user_id': user_id,
             'type': 'credit',
@@ -117,7 +111,6 @@ def add_points(user_id, points, reason, admin_id=None):
 
 
 def send_telegram_message(chat_id, text):
-    """Send message via Telegram Bot"""
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         payload = {
@@ -132,15 +125,46 @@ def send_telegram_message(chat_id, text):
         return None
 
 
+def delete_telegram_message(chat_id, message_id):
+    """Delete a specific message"""
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
+        payload = {
+            'chat_id': chat_id,
+            'message_id': message_id
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code == 200:
+            logger.info(f"✅ Deleted message {message_id} for user {chat_id}")
+        return response.json()
+    except Exception as e:
+        logger.error(f"Failed to delete message: {e}")
+        return None
+
+
+def edit_telegram_message(chat_id, message_id, new_text, reply_markup=None):
+    """Edit a message to show payment completed"""
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
+        payload = {
+            'chat_id': chat_id,
+            'message_id': message_id,
+            'text': new_text,
+            'parse_mode': 'HTML'
+        }
+        if reply_markup:
+            payload['reply_markup'] = reply_markup
+        response = requests.post(url, json=payload, timeout=10)
+        return response.json()
+    except Exception as e:
+        logger.error(f"Failed to edit message: {e}")
+        return None
+
+
 # ==================== WEBHOOK ROUTES ====================
 @app.route('/webhook', methods=['POST'])
 def payment_webhook():
-    """
-    Handle payment callback from darkxalpha.in
-    FIXED: Prevents double points addition
-    """
     try:
-        # Get data from request
         if request.is_json:
             data = request.get_json()
         else:
@@ -148,7 +172,6 @@ def payment_webhook():
         
         logger.info(f"📥 Webhook Received: {data}")
         
-        # Extract order_id and status
         order_id = data.get('order_id') or data.get('orderId') or data.get('txnid')
         status = str(data.get('status', '')).upper()
         amount = data.get('amount', '0')
@@ -159,22 +182,18 @@ def payment_webhook():
             logger.error("❌ No order_id in webhook data")
             return jsonify({"error": "Missing order_id"}), 400
         
-        # Generate unique webhook ID to prevent duplicates
         webhook_id = generate_webhook_id(order_id, timestamp, amount)
         
-        # CRITICAL FIX: Check if this webhook was already processed
-        # First check in-memory cache
+        # Check for duplicate
         if webhook_id in processed_webhooks:
-            logger.warning(f"⚠️ Duplicate webhook detected! Webhook ID: {webhook_id} already processed at {processed_webhooks[webhook_id]}")
+            logger.warning(f"⚠️ Duplicate webhook detected! Already processed")
             return "OK - Already Processed", 200
         
-        # Also check in database if order already has webhook_id
         existing_order = orders_col.find_one({'webhook_id': webhook_id})
         if existing_order:
-            logger.warning(f"⚠️ Duplicate webhook found in DB! Order: {order_id} already processed")
+            logger.warning(f"⚠️ Duplicate webhook found in DB!")
             return "OK - Already Processed", 200
         
-        # Find order in database
         order = orders_col.find_one({'order_id': order_id})
         if not order:
             order = orders_col.find_one({'api_order_id': order_id})
@@ -185,34 +204,28 @@ def payment_webhook():
         
         user_id = order.get('user_id')
         
-        # CRITICAL FIX: Check if order is already marked as completed
         if order.get('status') == 'completed':
-            logger.warning(f"⚠️ Order {order_id} already marked as completed! Skipping duplicate webhook.")
+            logger.warning(f"⚠️ Order {order_id} already marked as completed!")
             return "OK - Already Completed", 200
         
-        # Process based on status
         if status == "SUCCESS" or status == "COMPLETED":
             points = order.get('points', 0)
             
-            # DOUBLE CHECK: Verify if points already added via transaction
+            # Check if points already added
             existing_transaction = transactions_col.find_one({
                 'user_id': user_id,
                 'reason': {'$regex': f"Payment completed for order {order_id}"}
             })
             
             if existing_transaction:
-                logger.warning(f"⚠️ Points already added for order {order_id}! Transaction exists.")
+                logger.warning(f"⚠️ Points already added for order {order_id}!")
                 return "OK - Already Added", 200
             
-            # Add points to user (ONLY ONCE!)
-            new_balance = add_points(
-                user_id, 
-                points, 
-                f"Payment completed for order {order_id}"
-            )
+            # Add points
+            new_balance = add_points(user_id, points, f"Payment completed for order {order_id}")
             
             if new_balance:
-                # Update order status with webhook_id
+                # Update order
                 orders_col.update_one(
                     {'_id': order['_id']},
                     {'$set': {
@@ -226,20 +239,17 @@ def payment_webhook():
                     }}
                 )
                 
-                # Add to processed cache
                 processed_webhooks[webhook_id] = get_ist().strftime("%Y-%m-%d %H:%M:%S")
                 
-                # Clean old entries from cache (keep last 100)
+                # Clean old cache
                 if len(processed_webhooks) > 100:
                     keys_to_remove = list(processed_webhooks.keys())[:50]
                     for key in keys_to_remove:
                         del processed_webhooks[key]
                 
-                # Get user language preference
                 user = users_col.find_one({'user_id': user_id})
                 lang = user.get('language', 'en') if user else 'en'
                 
-                # Prepare success message
                 if lang == 'hi':
                     success_msg = f"""
 ✅ <b>पेमेंट सफल!</b>
@@ -250,7 +260,6 @@ def payment_webhook():
 📅 समय: {format_ist(get_ist())}
 
 🎉 आपके पॉइंट्स आपके अकाउंट में जोड़ दिए गए हैं!
-आप अब सर्च सेवा का उपयोग कर सकते हैं।
 
 👑 एडमिन: {OWNER_USERNAME}
                     """
@@ -264,13 +273,17 @@ def payment_webhook():
 📅 Time: {format_ist(get_ist())}
 
 🎉 Your points have been added to your account!
-You can now use the search service.
 
 👑 Admin: {OWNER_USERNAME}
                     """
                 
-                # Send success message to user (ONLY ONCE)
+                # Send success message
                 send_telegram_message(user_id, success_msg)
+                
+                # TRY TO DELETE THE OLD PAYMENT LINK MESSAGE
+                payment_msg_id = order.get('payment_message_id')
+                if payment_msg_id:
+                    delete_telegram_message(user_id, payment_msg_id)
                 
                 # Notify admin
                 admin_msg = f"""
@@ -280,21 +293,19 @@ You can now use the search service.
 👤 User: <code>{user_id}</code>
 💰 Amount: ₹{amount}
 📦 Points: {points}
-🔖 UTR: {utr}
 🕐 Time: {format_ist(get_ist())}
 
-✅ Points automatically added via webhook!
+✅ Points added! Payment message deleted.
                 """
                 send_telegram_message(OWNER_ID, admin_msg)
                 
-                logger.info(f"✅ Payment processed successfully for order {order_id} (Webhook ID: {webhook_id})")
+                logger.info(f"✅ Payment processed successfully for order {order_id}")
                 return "OK", 200
             else:
                 logger.error(f"❌ Failed to add points for order {order_id}")
                 return jsonify({"error": "Failed to add points"}), 500
                 
         elif status == "FAILED" or status == "ERROR":
-            # Update order as failed
             orders_col.update_one(
                 {'_id': order['_id']},
                 {'$set': {
@@ -307,7 +318,6 @@ You can now use the search service.
                 }}
             )
             
-            # Notify user about failure
             user = users_col.find_one({'user_id': user_id})
             lang = user.get('language', 'en') if user else 'en'
             
@@ -347,10 +357,9 @@ Please try again or contact admin.
 
 @app.route('/webhook', methods=['GET'])
 def webhook_get():
-    """Handle GET requests (for testing)"""
     return jsonify({
         "status": "active",
-        "message": "Payment webhook is running (FIXED - No Double Points)",
+        "message": "Payment webhook is running (FIXED - Auto Delete + No Double Points)",
         "time": format_ist(get_ist()),
         "processed_count": len(processed_webhooks)
     }), 200
@@ -358,7 +367,6 @@ def webhook_get():
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Health check endpoint"""
     try:
         users_col.count_documents({})
         db_status = "connected"
@@ -369,50 +377,23 @@ def health_check():
         "status": "healthy",
         "database": db_status,
         "time": format_ist(get_ist()),
-        "version": "3.0 - Fixed Double Webhook"
+        "version": "3.0 - Fixed"
     }), 200
 
 
-@app.route('/webhook/stats', methods=['GET'])
-def webhook_stats():
-    """Get webhook statistics"""
-    try:
-        total_webhooks = orders_col.count_documents({'webhook_received': {'$exists': True}})
-        completed_via_webhook = orders_col.count_documents({'webhook_received': {'$exists': True}, 'status': 'completed'})
-        duplicate_detected = orders_col.count_documents({'duplicate': True}) if 'duplicate' in orders_col.index_information() else 0
-        
-        return jsonify({
-            "total_webhooks_received": total_webhooks,
-            "completed_via_webhook": completed_via_webhook,
-            "cache_size": len(processed_webhooks),
-            "duplicate_prevented": duplicate_detected,
-            "last_webhook": orders_col.find_one(
-                {'webhook_received': {'$exists': True}},
-                sort=[('webhook_received', -1)]
-            ).get('webhook_received') if total_webhooks > 0 else None
-        }), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ==================== MAIN ====================
 if __name__ == '__main__':
     print("=" * 50)
-    print("🌐 PAYMENT WEBHOOK SERVER STARTED (FIXED - NO DOUBLE POINTS)")
+    print("🌐 PAYMENT WEBHOOK SERVER STARTED (FIXED)")
     print("=" * 50)
     print(f"🕐 Time: {format_ist(get_ist())} IST")
     print(f"📡 Webhook URL: http://your-server:5000/webhook")
     print(f"💓 Health Check: http://your-server:5000/health")
-    print(f"📊 Stats URL: http://your-server:5000/webhook/stats")
     print(f"👑 Admin: {OWNER_USERNAME}")
     print("=" * 50)
     print("✅ FIXES APPLIED:")
-    print("   ✓ Webhook ID Generation for duplicate detection")
-    print("   ✓ In-memory cache for recent webhooks")
-    print("   ✓ Database duplicate check")
-    print("   ✓ Order status verification before adding points")
-    print("   ✓ Transaction existence check")
+    print("   ✓ Double Webhook Prevention")
+    print("   ✓ Auto Delete Payment Message Trigger")
+    print("   ✓ Idempotency Check")
     print("=" * 50)
     
-    # Run Flask app
     app.run(host='0.0.0.0', port=5000, debug=False)
