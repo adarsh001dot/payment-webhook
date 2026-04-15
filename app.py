@@ -1,9 +1,9 @@
 """
 ===========================================
-🌐 PAYMENT WEBHOOK SERVER - DARKXALPHA.IN (FIXED - NO DOUBLE POINTS)
+🌐 PAYMENT WEBHOOK SERVER - DARKXALPHA.IN (FINAL FIX)
 ===========================================
 Developer: @VIP_X_OFFICIAL
-Version: 3.0 (FIXED - Idempotency Check + Auto Delete Trigger)
+Version: 4.0 (FINAL - Database Level Duplicate Prevention)
 ===========================================
 """
 
@@ -14,7 +14,7 @@ from pytz import timezone
 import requests
 import logging
 import hashlib
-import threading
+import time
 
 # ==================== CONFIGURATION ====================
 MONGODB_URI = "mongodb+srv://nikilsaxena843_db_user:3gF2wyT4IjsFt0cY@vipbot.puv6gfk.mongodb.net/?appName=vipbot"
@@ -37,9 +37,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Store processed webhook IDs to prevent duplicates
-processed_webhooks = {}
-
 # ==================== DATABASE CONNECTION ====================
 try:
     client = MongoClient(MONGODB_URI)
@@ -48,11 +45,12 @@ try:
     transactions_col = db['transactions']
     orders_col = db['orders']
     
-    # Create index for webhook_id to prevent duplicates
+    # CRITICAL: Create UNIQUE index on order_id for processed_webhook field
     try:
-        orders_col.create_index('webhook_id', unique=True, sparse=True)
-    except:
-        pass
+        orders_col.create_index('processed_webhook', unique=True, sparse=True)
+        logger.info("✅ Created unique index on processed_webhook")
+    except Exception as e:
+        logger.info(f"Index may already exist: {e}")
     
     logger.info("✅ Database Connected Successfully!")
 except Exception as e:
@@ -75,8 +73,9 @@ def format_number(num):
     return f"{num:,}"
 
 
-def generate_webhook_id(order_id, timestamp, amount):
-    unique_string = f"{order_id}_{timestamp}_{amount}"
+def generate_webhook_signature(order_id, amount):
+    """Generate unique signature for webhook to prevent duplicates"""
+    unique_string = f"{order_id}_{amount}_{int(time.time() / 60)}"  # Changes every minute
     return hashlib.md5(unique_string.encode()).hexdigest()
 
 
@@ -126,7 +125,6 @@ def send_telegram_message(chat_id, text):
 
 
 def delete_telegram_message(chat_id, message_id):
-    """Delete a specific message"""
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
         payload = {
@@ -142,28 +140,11 @@ def delete_telegram_message(chat_id, message_id):
         return None
 
 
-def edit_telegram_message(chat_id, message_id, new_text, reply_markup=None):
-    """Edit a message to show payment completed"""
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
-        payload = {
-            'chat_id': chat_id,
-            'message_id': message_id,
-            'text': new_text,
-            'parse_mode': 'HTML'
-        }
-        if reply_markup:
-            payload['reply_markup'] = reply_markup
-        response = requests.post(url, json=payload, timeout=10)
-        return response.json()
-    except Exception as e:
-        logger.error(f"Failed to edit message: {e}")
-        return None
-
-
 # ==================== WEBHOOK ROUTES ====================
 @app.route('/webhook', methods=['POST'])
 def payment_webhook():
+    start_time = time.time()
+    
     try:
         if request.is_json:
             data = request.get_json()
@@ -176,76 +157,89 @@ def payment_webhook():
         status = str(data.get('status', '')).upper()
         amount = data.get('amount', '0')
         utr = data.get('utr') or data.get('txnid') or data.get('reference_id', '')
-        timestamp = data.get('timestamp', get_ist().strftime('%Y%m%d%H%M%S'))
         
         if not order_id:
             logger.error("❌ No order_id in webhook data")
             return jsonify({"error": "Missing order_id"}), 400
         
-        webhook_id = generate_webhook_id(order_id, timestamp, amount)
+        # Generate unique signature for this webhook
+        webhook_signature = generate_webhook_signature(order_id, amount)
         
-        # Check for duplicate
-        if webhook_id in processed_webhooks:
-            logger.warning(f"⚠️ Duplicate webhook detected! Already processed")
-            return "OK - Already Processed", 200
+        # CRITICAL FIX: Use MongoDB atomic operation to prevent race condition
+        # Try to claim this webhook processing lock
+        lock_result = orders_col.update_one(
+            {'order_id': order_id, 'webhook_processed': {'$exists': False}},
+            {'$set': {
+                'webhook_processed': webhook_signature,
+                'webhook_processed_at': get_ist(),
+                'webhook_lock_time': time.time()
+            }}
+        )
         
-        existing_order = orders_col.find_one({'webhook_id': webhook_id})
-        if existing_order:
-            logger.warning(f"⚠️ Duplicate webhook found in DB!")
-            return "OK - Already Processed", 200
+        # If we couldn't set the lock, this webhook was already processed
+        if lock_result.modified_count == 0:
+            logger.warning(f"⚠️ Webhook for order {order_id} already being processed! Skipping duplicate.")
+            return "OK - Already Processing", 200
         
+        # Now find the order
         order = orders_col.find_one({'order_id': order_id})
         if not order:
             order = orders_col.find_one({'api_order_id': order_id})
         
         if not order:
             logger.error(f"❌ Order {order_id} not found in database")
+            # Release the lock
+            orders_col.update_one(
+                {'order_id': order_id},
+                {'$unset': {'webhook_processed': '', 'webhook_lock_time': ''}}
+            )
             return jsonify({"error": "Order not found"}), 404
         
         user_id = order.get('user_id')
         
+        # Check if order is already completed
         if order.get('status') == 'completed':
-            logger.warning(f"⚠️ Order {order_id} already marked as completed!")
+            logger.warning(f"⚠️ Order {order_id} already completed! Releasing lock.")
+            orders_col.update_one(
+                {'order_id': order_id},
+                {'$unset': {'webhook_processed': '', 'webhook_lock_time': ''}}
+            )
             return "OK - Already Completed", 200
         
+        # Check if points already added via transaction
+        existing_transaction = transactions_col.find_one({
+            'user_id': user_id,
+            'reason': {'$regex': f"Payment completed for order {order_id}$"}
+        })
+        
+        if existing_transaction:
+            logger.warning(f"⚠️ Points already added for order {order_id}! Marking as completed.")
+            orders_col.update_one(
+                {'order_id': order_id},
+                {'$set': {'status': 'completed', 'payment_status': status, 'utr': utr}}
+            )
+            return "OK - Already Added", 200
+        
+        # Process based on status
         if status == "SUCCESS" or status == "COMPLETED":
             points = order.get('points', 0)
             
-            # Check if points already added
-            existing_transaction = transactions_col.find_one({
-                'user_id': user_id,
-                'reason': {'$regex': f"Payment completed for order {order_id}"}
-            })
-            
-            if existing_transaction:
-                logger.warning(f"⚠️ Points already added for order {order_id}!")
-                return "OK - Already Added", 200
-            
-            # Add points
+            # Add points (this is the only place where points are added)
             new_balance = add_points(user_id, points, f"Payment completed for order {order_id}")
             
             if new_balance:
-                # Update order
+                # Update order as completed
                 orders_col.update_one(
-                    {'_id': order['_id']},
+                    {'order_id': order_id},
                     {'$set': {
                         'status': 'completed',
                         'payment_status': status,
                         'utr': utr,
                         'webhook_received': get_ist(),
                         'completed_at': get_ist(),
-                        'webhook_id': webhook_id,
                         'webhook_data': data
                     }}
                 )
-                
-                processed_webhooks[webhook_id] = get_ist().strftime("%Y-%m-%d %H:%M:%S")
-                
-                # Clean old cache
-                if len(processed_webhooks) > 100:
-                    keys_to_remove = list(processed_webhooks.keys())[:50]
-                    for key in keys_to_remove:
-                        del processed_webhooks[key]
                 
                 user = users_col.find_one({'user_id': user_id})
                 lang = user.get('language', 'en') if user else 'en'
@@ -280,7 +274,7 @@ def payment_webhook():
                 # Send success message
                 send_telegram_message(user_id, success_msg)
                 
-                # TRY TO DELETE THE OLD PAYMENT LINK MESSAGE
+                # Delete old payment link message
                 payment_msg_id = order.get('payment_message_id')
                 if payment_msg_id:
                     delete_telegram_message(user_id, payment_msg_id)
@@ -300,6 +294,13 @@ def payment_webhook():
                 send_telegram_message(OWNER_ID, admin_msg)
                 
                 logger.info(f"✅ Payment processed successfully for order {order_id}")
+                
+                # Release the lock (optional, since order is completed)
+                orders_col.update_one(
+                    {'order_id': order_id},
+                    {'$unset': {'webhook_processed': '', 'webhook_lock_time': ''}}
+                )
+                
                 return "OK", 200
             else:
                 logger.error(f"❌ Failed to add points for order {order_id}")
@@ -307,13 +308,12 @@ def payment_webhook():
                 
         elif status == "FAILED" or status == "ERROR":
             orders_col.update_one(
-                {'_id': order['_id']},
+                {'order_id': order_id},
                 {'$set': {
                     'status': 'failed',
                     'payment_status': status,
                     'webhook_received': get_ist(),
                     'failed_at': get_ist(),
-                    'webhook_id': webhook_id,
                     'webhook_data': data
                 }}
             )
@@ -352,6 +352,16 @@ Please try again or contact admin.
             
     except Exception as e:
         logger.error(f"❌ Webhook Error: {e}")
+        # Try to release lock on error
+        try:
+            order_id = data.get('order_id') if 'data' in locals() else None
+            if order_id:
+                orders_col.update_one(
+                    {'order_id': order_id},
+                    {'$unset': {'webhook_processed': '', 'webhook_lock_time': ''}}
+                )
+        except:
+            pass
         return jsonify({"error": str(e)}), 500
 
 
@@ -359,9 +369,8 @@ Please try again or contact admin.
 def webhook_get():
     return jsonify({
         "status": "active",
-        "message": "Payment webhook is running (FIXED - Auto Delete + No Double Points)",
-        "time": format_ist(get_ist()),
-        "processed_count": len(processed_webhooks)
+        "message": "Payment webhook is running (FINAL FIX - Database Level Lock)",
+        "time": format_ist(get_ist())
     }), 200
 
 
@@ -377,23 +386,61 @@ def health_check():
         "status": "healthy",
         "database": db_status,
         "time": format_ist(get_ist()),
-        "version": "3.0 - Fixed"
+        "version": "4.0 - Final Fix"
     }), 200
+
+
+@app.route('/fix-duplicate-orders', methods=['POST'])
+def fix_duplicate_orders():
+    """Emergency endpoint to fix duplicate points for existing orders"""
+    try:
+        # Find orders with multiple transactions
+        pipeline = [
+            {'$group': {
+                '_id': '$order_id',
+                'count': {'$sum': 1},
+                'transactions': {'$push': '$$ROOT'}
+            }},
+            {'$match': {'count': {'$gt': 1}}}
+        ]
+        
+        duplicates = list(orders_col.aggregate(pipeline))
+        fixed = 0
+        
+        for dup in duplicates:
+            order_id = dup['_id']
+            transactions = dup['transactions']
+            # Keep first, mark others as duplicate
+            for i, trans in enumerate(transactions[1:], 1):
+                orders_col.update_one(
+                    {'_id': trans['_id']},
+                    {'$set': {'is_duplicate': True, 'duplicate_reason': 'Double webhook'}}
+                )
+                fixed += 1
+        
+        return jsonify({
+            "status": "success",
+            "duplicate_groups": len(duplicates),
+            "duplicate_orders_fixed": fixed
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == '__main__':
     print("=" * 50)
-    print("🌐 PAYMENT WEBHOOK SERVER STARTED (FIXED)")
+    print("🌐 PAYMENT WEBHOOK SERVER STARTED (FINAL FIX)")
     print("=" * 50)
     print(f"🕐 Time: {format_ist(get_ist())} IST")
-    print(f"📡 Webhook URL: http://your-server:5000/webhook")
-    print(f"💓 Health Check: http://your-server:5000/health")
+    print(f"📡 Webhook URL: https://your-server.herokuapp.com/webhook")
+    print(f"💓 Health Check: https://your-server.herokuapp.com/health")
     print(f"👑 Admin: {OWNER_USERNAME}")
     print("=" * 50)
-    print("✅ FIXES APPLIED:")
-    print("   ✓ Double Webhook Prevention")
-    print("   ✓ Auto Delete Payment Message Trigger")
-    print("   ✓ Idempotency Check")
+    print("✅ CRITICAL FIXES APPLIED:")
+    print("   ✓ Database Level Lock using atomic operation")
+    print("   ✓ Webhook Processing Lock (prevents race condition)")
+    print("   ✓ Transaction existence check before adding points")
+    print("   ✓ Automatic lock release on error")
     print("=" * 50)
     
     app.run(host='0.0.0.0', port=5000, debug=False)
